@@ -88,6 +88,8 @@ function _ground_state_external(basis::PlaneWaveBasis,
                         deepcopy(initial_orbitals)
     residual_energy = Inf
     residual_density = Inf
+    previous_fixed_point_residual = Inf
+    mixing = 0.5
     for iteration in 1:options.maxiter
         step = _electronic_step(
             kernel, density_value, number_bands, noccupied;
@@ -108,12 +110,23 @@ function _ground_state_external(basis::PlaneWaveBasis,
                 zeros(3, 3), false, step.output_density, step.band_values,
                 occupations_value, step.orbitals, residual_energy, residual_density)
         end
-        # V0 external/response solves are insulating and begin from a
-        # converged nearby state.  A weaker Kerker screen avoids damping the
-        # physically relevant long-wavelength response for hundreds of SCF
-        # iterations while retaining reciprocal-space preconditioning.
+        # Displaced supercells contain folded near-degenerate bands, so their
+        # exact occupied projector can expose charge sloshing hidden by an
+        # inexact eigensolve.  Back off the scalar mixing when the fixed-point
+        # residual grows; recover it slowly after contraction resumes.  The
+        # Kerker screen remains finite so long-wavelength response converges
+        # without destabilising the high-G components.
+        if isfinite(previous_fixed_point_residual)
+            if residual_density > 1.05previous_fixed_point_residual
+                mixing = max(0.05, 0.5mixing)
+            elseif residual_density < 0.7previous_fixed_point_residual
+                mixing = min(0.6, 1.1mixing)
+            end
+        end
         density_value = _mix_density(
-            density_value, step.output_density, kernel; screening=0.1)
+            density_value, step.output_density, kernel;
+            mixing, screening=0.5)
+        previous_fixed_point_residual = residual_density
         previous_energy = step.total
         previous_orbitals = step.orbitals
     end
