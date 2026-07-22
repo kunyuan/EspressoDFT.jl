@@ -124,7 +124,7 @@ function _supercell_data(gs::GroundState, q::NTuple{3,Float64})
     kpoints, weights = _folded_kpoints(basis, matrix)
     gvectors = [_enumerate_gvectors(super_lattice, k, getfield(basis, :_Ecut))
                 for k in kpoints]
-    fft_size = _required_fft_size(gvectors)
+    fft_size = _required_fft_size(super_lattice, getfield(basis, :_Ecut))
     super_basis = PlaneWaveBasis(
         super_model, getfield(basis, :_Ecut), getfield(basis, :_kgrid),
         kpoints, weights, gvectors, fft_size)
@@ -489,7 +489,7 @@ function _shifted_k_state(gs::GroundState, shift::NTuple{3,Float64};
     hartree_coefficients, _ = _hartree(gs.density_values, kernel)
     _, xc_potential = _xc_energy_potential(
         getfield(model, :_xc), gs.density_values, kernel.core_density,
-        reciprocal, volume)
+        reciprocal, volume, 4getfield(basis, :_Ecut))
     local_coefficients = kernel.ionic_coefficients .+ hartree_coefficients .+
                          fft(xc_potential) ./ length(xc_potential)
     noccupied = round(Int, getfield(model, :_electron_count) / 2)
@@ -642,7 +642,8 @@ function _electric_ground_data(gs::GroundState)
     hartree_coefficients, _ = _hartree(gs.density_values, gs.kernel)
     _, xc_potential = _xc_energy_potential(
         getfield(model, :_xc), gs.density_values, gs.kernel.core_density,
-        gs.kernel.reciprocal, gs.kernel.volume)
+        gs.kernel.reciprocal, gs.kernel.volume,
+        4getfield(basis, :_Ecut))
     local_coefficients = gs.kernel.ionic_coefficients .+ hartree_coefficients .+
                          fft(xc_potential) ./ length(xc_potential)
     band_values = [gs.band_values[kindex][1:noccupied]
@@ -759,7 +760,8 @@ function _electric_field_response(gs::GroundState,
         hartree = _real_from_coefficients(hartree_coefficients)
         xc_response = _xc_potential_response(
             getfield(model, :_xc), gs.density_values,
-            gs.kernel.core_density, delta_density, gs.kernel.reciprocal)
+            gs.kernel.core_density, delta_density, gs.kernel.reciprocal,
+            4getfield(basis, :_Ecut))
         updated = hartree .+ xc_response
         residual = norm(updated .- local_potential) / sqrt(length(updated))
         if residual <= tolerance

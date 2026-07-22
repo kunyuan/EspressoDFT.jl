@@ -155,7 +155,8 @@ function _stationary_energy_components(gs::GroundState, basis::PlaneWaveBasis)
     hartree_coefficients, hartree_energy = _hartree(density_value, kernel)
     xc_energy, _ = _xc_energy_potential(
         getfield(getfield(basis, :_model), :_xc), density_value,
-        kernel.core_density, kernel.reciprocal, kernel.volume)
+        kernel.core_density, kernel.reciprocal, kernel.volume,
+        4getfield(basis, :_Ecut))
 
     weights = getfield(basis, :_kweights)
     kpoints = getfield(basis, :_kpoints)
@@ -268,6 +269,11 @@ function _ewald_force_component(gs::GroundState, atom::Int, direction::Int;
     -(_ewald_energy(moved_model(plus)) - _ewald_energy(moved_model(minus))) / (2step)
 end
 
+function _enforce_zero_net_force!(values::AbstractMatrix{<:Real})
+    values .-= sum(values; dims=2) ./ size(values, 2)
+    values
+end
+
 function _compute_forces!(gs::GroundState)
     basis = gs.basis
     kernel = gs.kernel
@@ -276,7 +282,8 @@ function _compute_forces!(gs::GroundState)
     density_coefficients = fft(gs.density_values) / length(gs.density_values)
     _, xc_potential = _xc_energy_potential(
         getfield(getfield(basis, :_model), :_xc), gs.density_values,
-        kernel.core_density, kernel.reciprocal, kernel.volume)
+        kernel.core_density, kernel.reciprocal, kernel.volume,
+        4getfield(basis, :_Ecut))
     xc_coefficients = fft(xc_potential) / length(xc_potential)
     dims = size(gs.density_values)
 
@@ -324,6 +331,11 @@ function _compute_forces!(gs::GroundState)
         gs.force_values[direction, atom] = local_force + core_force +
             nonlocal_force + _ewald_force_component(gs, atom, direction)
     end
+    # A rigid translation cannot change a periodic total energy.  Project the
+    # small common-mode remainder from finite Ewald differentiation and
+    # independently converged k-point subspaces onto the exact acoustic sum
+    # rule before exposing forces or differentiating them again.
+    _enforce_zero_net_force!(gs.force_values)
     gs.force_computed = true
     gs
 end

@@ -19,13 +19,16 @@ The code follows the physical dependency order:
 2. `radial.jl` evaluates local, core-density, atomic-density, and projector
    radial transforms.
 3. `types.jl` defines immutable crystals, Kohn-Sham models, exact plane-wave
-   cutoffs, full k meshes, and SCF options.
-4. `xc.jl` evaluates one internally consistent LDA or PBE energy and potential.
+   cutoffs, full k meshes, the `4Ecut` density sphere and its minimal
+   small-prime FFT grid, and SCF options.
+4. `xc.jl` evaluates one internally consistent LDA or PBE energy and potential;
+   spectral derivatives and Hartree terms use that same density sphere.
 5. `hamiltonian.jl` builds local coefficients, Ewald and nonlocal terms, and
    applies dense or matrix-free Kohn-Sham Hamiltonians. Large bases use the
    package's own restarted, preconditioned block-Davidson solver.
 6. `ground_state.jl` solves the density fixed point and evaluates stationary
-   energy, analytic forces, and frozen-topology stress.
+   energy, analytic forces projected onto the periodic zero-net-force
+   subspace, and frozen-topology stress.
 7. `response.jl` evaluates atomic and commensurate-supercell phonon response.
    Its homogeneous-electric-field path solves the occupied-projected
    Sternheimer equations directly, without constructing or truncating an

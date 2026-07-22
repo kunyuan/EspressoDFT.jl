@@ -38,6 +38,31 @@ end
     @test_throws ArgumentError AtomicDisplacement(0, 1, (0, 0, 0))
 end
 
+@testset "UPF radial quadrature" begin
+    odd_values = collect(1.0:5.0)
+    even_values = collect(1.0:6.0)
+    @test EspressoDFT._simpson_integral(odd_values, ones(5)) == 12.0
+    @test EspressoDFT._simpson_integral(even_values, ones(6)) == 17.5
+
+    complex_values = complex.(even_values, reverse(even_values))
+    expected = (sum((4.0, 2.0, 4.0, 2.0) .* complex_values[2:5]) +
+                complex_values[1] - 0.25complex_values[4] +
+                complex_values[5] + 1.25complex_values[6]) / 3
+    @test EspressoDFT._simpson_integral(complex_values, ones(6)) == expected
+end
+
+@testset "density FFT grid sizing" begin
+    lattice = 10.0 .* Matrix{Float64}(I, 3, 3)
+    @test EspressoDFT._required_fft_size(lattice, 10.0) == (30, 30, 30)
+end
+
+@testset "periodic force acoustic sum rule" begin
+    values = [1.0 2.0 -2.0; -3.0 4.0 5.0; 0.5 -0.2 0.9]
+    returned = EspressoDFT._enforce_zero_net_force!(values)
+    @test returned === values
+    @test vec(sum(values; dims=2)) ≈ zeros(3) atol=10eps(Float64)
+end
+
 @testset "PBE energy and potential share one functional" begin
     dims = (6, 7, 8)
     lattice = [6.0 0.3 0.1; 0.0 5.0 0.2; 0.0 0.0 7.0]
@@ -67,6 +92,23 @@ end
         :pbe, rho .- step .* tangent, core, reciprocal, volume)[2]
     finite_kernel = (plus_potential .- minus_potential) ./ (2step)
     @test analytic_kernel ≈ finite_kernel atol=2e-7 rtol=2e-6
+end
+
+@testset "QE PBE gradient thresholds" begin
+    dims = (4, 4, 4)
+    reciprocal = 2pi .* Matrix{Float64}(I, 3, 3)
+    uniform_density = fill(0.2, dims)
+    zero_core = zeros(dims)
+    pbe_energy, pbe_potential = EspressoDFT._xc_energy_potential(
+        :pbe, uniform_density, zero_core, reciprocal, 1.0)
+    lda_x, lda_vx = EspressoDFT._libxc_lda_component(
+        EspressoDFT._XC_LDA_X, vec(uniform_density))
+    lda_c, lda_vc = EspressoDFT._libxc_lda_component(
+        EspressoDFT._XC_LDA_C_PW, vec(uniform_density))
+    expected_energy = sum(uniform_density .* reshape(lda_x .+ lda_c, dims)) /
+                      length(uniform_density)
+    @test pbe_energy ≈ expected_energy atol=1e-13 rtol=1e-13
+    @test pbe_potential ≈ reshape(lda_vx .+ lda_vc, dims) atol=1e-13 rtol=1e-13
 end
 
 @testset "symmetry-reduced polar response basis" begin

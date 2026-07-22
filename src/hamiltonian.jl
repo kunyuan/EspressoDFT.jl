@@ -256,6 +256,7 @@ function _hartree(density::Array{Float64,3}, kernel::PWKernel)
         g = _grid_g((i, j, k), dims)
         all(iszero, g) && continue
         q2 = sum(abs2, kernel.reciprocal * collect(g))
+        q2 / 2 <= 4getfield(kernel.basis, :_Ecut) || continue
         potential_coefficients[i, j, k] = 4pi * coefficients[i, j, k] / q2
         energy_value += 2pi * kernel.volume * abs2(coefficients[i, j, k]) / q2
     end
@@ -500,7 +501,8 @@ function _electronic_step(kernel::PWKernel, density_value::Array{Float64,3},
     hartree_coefficients, hartree_energy = _hartree(density_value, kernel)
     xc_energy, xc_potential = _xc_energy_potential(
         getfield(getfield(kernel.basis, :_model), :_xc), density_value,
-        kernel.core_density, kernel.reciprocal, kernel.volume)
+        kernel.core_density, kernel.reciprocal, kernel.volume,
+        4getfield(kernel.basis, :_Ecut))
     xc_coefficients = fft(xc_potential) / length(xc_potential)
     local_coefficients = kernel.ionic_coefficients .+ hartree_coefficients .+ xc_coefficients
     external_coefficients === nothing || (local_coefficients .+= external_coefficients)

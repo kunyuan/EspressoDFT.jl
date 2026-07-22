@@ -4,17 +4,24 @@ function _simpson_integral(values::AbstractVector{<:Number},
     n = length(values)
     n >= 3 || throw(ArgumentError("radial mesh needs at least three points"))
     result = zero(promote_type(eltype(values), Float64))
-    for index in 1:n
-        coefficient = if index == 1 || index == n
-            1 / 3
-        elseif iseven(index)
-            4 / 3
-        else
-            2 / 3
-        end
+    for index in 2:(n - 1)
+        coefficient = iseven(index) ? 4.0 : 2.0
         result += coefficient * values[index] * radial_weights[index]
     end
-    result
+    if isodd(n)
+        result += values[1] * radial_weights[1] +
+                  values[n] * radial_weights[n]
+    else
+        # QE's even-mesh endpoint rule retains the composite-Simpson
+        # interior and corrects its final three samples.  UPF radial meshes
+        # are commonly even, so applying the odd-mesh weights there shifts
+        # every local, NLCC, and nonlocal radial transform coherently.
+        result += values[1] * radial_weights[1] -
+                  0.25 * values[n - 2] * radial_weights[n - 2] +
+                  values[n - 1] * radial_weights[n - 1] +
+                  1.25 * values[n] * radial_weights[n]
+    end
+    result / 3
 end
 
 function _spherical_bessel(l::Int, x::Real)
