@@ -3,6 +3,7 @@ struct Crystal
     _species::Vector{Symbol}
     _positions::Matrix{Float64}
     _masses::Vector{Float64}
+    _positions_are_fractional::Bool
 end
 
 function Crystal(lattice::AbstractMatrix, species::AbstractVector{Symbol},
@@ -24,7 +25,7 @@ function Crystal(lattice::AbstractMatrix, species::AbstractVector{Symbol},
              "masses must be finite and positive")
     fractional = positions_are_fractional ? pos : h \ pos
     fractional = mod.(fractional, 1.0)
-    Crystal(h, collect(Symbol, species), fractional, mass)
+    Crystal(h, collect(Symbol, species), fractional, mass, positions_are_fractional)
 end
 
 function Base.getproperty(crystal::Crystal, name::Symbol)
@@ -113,6 +114,10 @@ struct AtomicDisplacement
         new(Int(atom), Int(direction), _copy_tuple3(q))
     end
 end
+
+AtomicDisplacement(atom::Integer, direction::Integer,
+                   q::Tuple{<:Real,<:Real,<:Real}) =
+    AtomicDisplacement(atom, direction, _copy_tuple3(q))
 
 struct PlaneWaveBasis
     _model::KSModel

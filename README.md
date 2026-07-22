@@ -12,3 +12,6 @@ The first milestone covers spin-unpolarized insulating crystals with
 norm-conserving UPF 2.0.1 pseudopotentials, LDA/PBE, full Monkhorst-Pack meshes,
 ground-state observables, atomic response, phonons, polar tensors, and
 ChainRules-compatible implicit derivatives.
+
+The implementation boundary and differentiability model are described in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
