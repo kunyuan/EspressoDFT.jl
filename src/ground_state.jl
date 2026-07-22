@@ -310,16 +310,16 @@ function _compute_forces!(gs::GroundState)
                 weighted_factors[row, local_column] =
                     im * momenta[row][direction] * projectors.factors[row, column]
             end
-            for band in axes(gs.orbitals[kindex], 2)
-                gs.occupation_values[kindex][band] > 0 || continue
-                coefficients = gs.orbitals[kindex][:, band]
-                projected = projectors.factors' * coefficients
-                coupled = projectors.coupling * projected
-                derivative_action = weighted_factors * coupled[columns]
-                nonlocal_force += 2getfield(basis, :_kweights)[kindex] *
-                                  gs.occupation_values[kindex][band] *
-                                  real(dot(coefficients, derivative_action))
-            end
+            occupied = findall(>(0), gs.occupation_values[kindex])
+            isempty(occupied) && continue
+            coefficients = @view gs.orbitals[kindex][:, occupied]
+            projected = projectors.factors' * coefficients
+            coupled = projectors.coupling * projected
+            derivative_action = weighted_factors * coupled[columns, :]
+            band_values = vec(real.(sum(conj.(coefficients) .* derivative_action;
+                                        dims=1)))
+            nonlocal_force += 2getfield(basis, :_kweights)[kindex] *
+                              dot(gs.occupation_values[kindex][occupied], band_values)
         end
         gs.force_values[direction, atom] = local_force + core_force +
             nonlocal_force + _ewald_force_component(gs, atom, direction)
