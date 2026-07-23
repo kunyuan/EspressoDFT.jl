@@ -18,6 +18,8 @@ private fixtures. The suite includes:
 - scoped QE input parsing and fail-closed unsupported input;
 - commensurate-q/supercell helpers and a directly solvable Sternheimer system;
 - public accessor and geometry ChainRules pullbacks.
+- a bounded synthetic ground-state, QE-input, Gamma-response, and phonon
+  workflow that checks invariants without claiming external accuracy.
 
 The synthetic UPF is test data generated in memory. It is not a physical
 pseudopotential and is never used as a scientific reference.
