@@ -3,6 +3,7 @@ struct Crystal
     _species::Vector{Symbol}
     _positions::Matrix{Float64}
     _masses::Vector{Float64}
+    _positions_are_fractional::Bool
 end
 
 function Crystal(lattice::AbstractMatrix, species::AbstractVector{Symbol},
@@ -24,7 +25,7 @@ function Crystal(lattice::AbstractMatrix, species::AbstractVector{Symbol},
              "masses must be finite and positive")
     fractional = positions_are_fractional ? pos : h \ pos
     fractional = mod.(fractional, 1.0)
-    Crystal(h, collect(Symbol, species), fractional, mass)
+    Crystal(h, collect(Symbol, species), fractional, mass, positions_are_fractional)
 end
 
 function Base.getproperty(crystal::Crystal, name::Symbol)
@@ -114,6 +115,10 @@ struct AtomicDisplacement
     end
 end
 
+AtomicDisplacement(atom::Integer, direction::Integer,
+                   q::Tuple{<:Real,<:Real,<:Real}) =
+    AtomicDisplacement(atom, direction, _copy_tuple3(q))
+
 struct PlaneWaveBasis
     _model::KSModel
     _Ecut::Float64
@@ -152,12 +157,22 @@ function _enumerate_gvectors(lattice::Matrix{Float64}, k::NTuple{3,Float64},
     sort!(vectors)
 end
 
-function _required_fft_size(gvectors::Vector{Vector{NTuple{3,Int}}})
+function _required_fft_size(lattice::Matrix{Float64}, Ecut::Float64)
+    reciprocal = TWO_PI .* inv(lattice)'
+    density_cutoff = 4Ecut
+    radius = sqrt(2density_cutoff) / minimum(svdvals(reciprocal))
+    bound = ceil(Int, radius) + 1
     maximum_abs = zeros(Int, 3)
-    for vectors in gvectors, g in vectors, axis in 1:3
-        maximum_abs[axis] = max(maximum_abs[axis], abs(g[axis]))
+    for g1 in -bound:bound, g2 in -bound:bound, g3 in -bound:bound
+        g = (g1, g2, g3)
+        sum(abs2, reciprocal * collect(g)) / 2 < density_cutoff || continue
+        for axis in 1:3
+            maximum_abs[axis] = max(maximum_abs[axis], abs(g[axis]))
+        end
     end
-    ntuple(axis -> nextprod((2, 3, 5), 4maximum_abs[axis] + 1), 3)
+    # The density sphere touches its periodic image at 2*gmax+1.  Round that
+    # minimal grid up to the same small-prime FFT orders used by QE/FFTW.
+    ntuple(axis -> nextprod((2, 3, 5), 2maximum_abs[axis] + 1), 3)
 end
 
 function PlaneWaveBasis(model::KSModel; Ecut::Real,
@@ -170,7 +185,7 @@ function PlaneWaveBasis(model::KSModel; Ecut::Real,
     weights = fill(inv(Float64(length(kpoints))), length(kpoints))
     lattice = getfield(getfield(model, :_crystal), :_lattice)
     gvectors = [_enumerate_gvectors(lattice, k, Float64(Ecut)) for k in kpoints]
-    required = _required_fft_size(gvectors)
+    required = _required_fft_size(lattice, Float64(Ecut))
     selected = if fft_size === nothing
         required
     else
