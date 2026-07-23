@@ -15,3 +15,6 @@ ChainRules-compatible implicit derivatives.
 
 The implementation boundary and differentiability model are described in
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
+The public/private test boundary and the fast numerical-kernel suite are
+described in [`docs/TESTING.md`](docs/TESTING.md).
