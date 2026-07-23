@@ -1,6 +1,9 @@
 using EspressoDFT
+using ChainRulesCore
 using LinearAlgebra
 using Test
+
+include("helpers.jl")
 
 @testset "public export boundary" begin
     expected = Set([
@@ -134,3 +137,9 @@ end
     @test aln_queries == [(1, 1), (1, 3), (3, 1), (3, 3)]
     @test rank(aln_design) == 4
 end
+
+include("unit/upf_radial.jl")
+include("unit/hamiltonian.jl")
+include("unit/qe_input.jl")
+include("unit/response_chainrules.jl")
+include("integration/synthetic_workflow.jl")
