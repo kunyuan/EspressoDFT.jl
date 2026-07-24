@@ -11,10 +11,20 @@ Libxc_jll = "a56a6d9d-ad03-58af-ab61-878bf78270d6"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
 
+[weakdeps]
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+MPI = "da04e1cc-30fd-572f-bb4f-1f8673147195"
+
+[extensions]
+EspressoDFTCUDAExt = "CUDA"
+EspressoDFTMPIExt = "MPI"
+
 [compat]
 ChainRulesCore = "1"
+CUDA = "5"
 FFTW = "1"
 Libxc_jll = "7"
+MPI = "0.20"
 SpecialFunctions = "2"
 julia = "1.12"
 

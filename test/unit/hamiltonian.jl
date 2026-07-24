@@ -47,6 +47,29 @@ end
     @test output ≈ dense * vector atol=5e-11 rtol=5e-11
     @test_throws DimensionMismatch mul!(
         zeros(ComplexF64, length(vector) - 1), operator, vector)
+
+    block = hcat(vector, conj.(vector))
+    block_output = similar(block)
+    mul!(block_output, operator, block)
+    buffer = operator.workspace.batches[2].grid
+    allocated = @allocated mul!(block_output, operator, block)
+    @test block_output ≈ dense * block atol=5e-11 rtol=5e-11
+    @test operator.workspace.batches[2].grid === buffer
+    @test allocated <= 1024
+    @test EspressoDFT._use_dense_eigensolver(19, 1)
+    @test !EspressoDFT._use_dense_eigensolver(400, 4)
+end
+
+@testset "radial projectors are cached across equivalent k-point builds" begin
+    kernel = SYNTHETIC_KERNEL
+    first_projectors = EspressoDFT._nonlocal_projectors(
+        SYNTHETIC_BASIS, 1, kernel.reciprocal, kernel.volume)
+    cache_size = length(EspressoDFT._RADIAL_PROJECTOR_CACHE)
+    second_projectors = EspressoDFT._nonlocal_projectors(
+        SYNTHETIC_BASIS, 1, kernel.reciprocal, kernel.volume)
+    @test first_projectors.factors == second_projectors.factors
+    @test first_projectors.coupling == second_projectors.coupling
+    @test length(EspressoDFT._RADIAL_PROJECTOR_CACHE) == cache_size
 end
 
 @testset "Hartree and density mixing preserve physical invariants" begin
@@ -68,6 +91,22 @@ end
     target_average = SYNTHETIC_BASIS.model.electron_count / kernel.volume
     @test sum(mixed) / length(mixed) ≈ target_average atol=5e-15
     @test all(isfinite, mixed)
+
+    mixer = EspressoDFT.DensityMixer(max_history=4)
+    current = fill(target_average, size(uniform))
+    fixed_point = copy(current)
+    for index in CartesianIndices(fixed_point)
+        fixed_point[index] +=
+            0.01cos(2pi * (index[1] - 1) / size(fixed_point, 1))
+    end
+    initial_error = norm(current - fixed_point)
+    for _ in 1:8
+        output = 0.25current .+ 0.75fixed_point
+        current = EspressoDFT._anderson_mix!(mixer, current, output, kernel)
+    end
+    @test norm(current - fixed_point) < 0.05initial_error
+    @test length(mixer.densities) <= mixer.max_history
+    @test sum(current) / length(current) ≈ target_average atol=5e-15
 end
 
 @testset "block eigensolver agrees with direct diagonalization on a small basis" begin

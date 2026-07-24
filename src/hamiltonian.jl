@@ -1,7 +1,56 @@
+abstract type AbstractSCFBackend end
+struct ThreadedCPUBackend <: AbstractSCFBackend end
+
+# Optional package extensions add methods without widening the frozen export
+# surface or making MPI/CUDA hard dependencies of the CPU package.
+function mpi_ground_state end
+function gpu_ground_state end
+
 struct NonlocalProjectors
     factors::Matrix{ComplexF64}
     coupling::Matrix{Float64}
     atoms::Vector{Int}
+end
+
+const _RADIAL_PROJECTOR_CACHE =
+    Dict{Tuple{UInt,Int,Float64},Float64}()
+const _RADIAL_PROJECTOR_CACHE_LOCK = ReentrantLock()
+
+function _cached_projector_transform(
+    upf::UPFData,
+    signature::UInt,
+    projector::Int,
+    q::Float64,
+)
+    key = (signature, projector, q)
+    cached = lock(_RADIAL_PROJECTOR_CACHE_LOCK) do
+        get(_RADIAL_PROJECTOR_CACHE, key, nothing)
+    end
+    cached === nothing || return cached
+    value = _projector_transform(upf, projector, q)
+    lock(_RADIAL_PROJECTOR_CACHE_LOCK) do
+        get!(_RADIAL_PROJECTOR_CACHE, key, value)
+    end
+end
+
+mutable struct HamiltonianBatchBuffer
+    grid::Array{ComplexF64,4}
+    forward_plan::Any
+    inverse_plan::Any
+    overlaps::Matrix{ComplexF64}
+    coupled_overlaps::Matrix{ComplexF64}
+end
+
+mutable struct HamiltonianWorkspace
+    dims::NTuple{3,Int}
+    number_projectors::Int
+    batches::Dict{Int,HamiltonianBatchBuffer}
+end
+
+mutable struct DensityWorkspace
+    buffers::Vector{Array{ComplexF64,3}}
+    inverse_plans::Vector{Any}
+    partial_densities::Vector{Array{Float64,3}}
 end
 
 struct PWKernel
@@ -15,6 +64,70 @@ struct PWKernel
     initial_density::Array{Float64,3}
     nonlocal_projectors::Vector{NonlocalProjectors}
     ion_ion_energy::Float64
+    fft_indices::Vector{Vector{Int}}
+    kinetic_energies::Vector{Vector{Float64}}
+    grid_q2::Array{Float64,3}
+    hamiltonian_workspaces::Vector{HamiltonianWorkspace}
+    density_workspace::DensityWorkspace
+end
+
+function _basis_geometry_cache(
+    basis::PlaneWaveBasis,
+    reciprocal::Matrix{Float64},
+    nonlocal_projectors::Vector{NonlocalProjectors},
+)
+    dims = getfield(basis, :_fft_size)
+    linear = LinearIndices(dims)
+    fft_indices = [
+        [linear[_fft_index(g, dims)...] for g in gvectors]
+        for gvectors in getfield(basis, :_G_vectors)
+    ]
+    kinetic_energies = [
+        [sum(abs2, reciprocal * (collect(kpoint) .+ collect(g))) / 2
+         for g in gvectors]
+        for (kpoint, gvectors) in
+            zip(getfield(basis, :_kpoints), getfield(basis, :_G_vectors))
+    ]
+    grid_q2 = Array{Float64}(undef, dims)
+    for index in CartesianIndices(grid_q2)
+        grid_q2[index] = sum(abs2, reciprocal *
+                            collect(_grid_g(Tuple(index), dims)))
+    end
+    hamiltonian_workspaces = [
+        HamiltonianWorkspace(dims, size(projectors.factors, 2),
+                             Dict{Int,HamiltonianBatchBuffer}())
+        for projectors in nonlocal_projectors
+    ]
+    buffers = [zeros(ComplexF64, dims) for _ in fft_indices]
+    inverse_plans = Any[
+        plan_ifft!(buffer; flags=FFTW.ESTIMATE) for buffer in buffers
+    ]
+    partial_densities = [zeros(Float64, dims) for _ in fft_indices]
+    density_workspace = DensityWorkspace(
+        buffers, inverse_plans, partial_densities)
+    (; fft_indices, kinetic_energies, grid_q2, hamiltonian_workspaces,
+       density_workspace)
+end
+
+function PWKernel(
+    basis::PlaneWaveBasis,
+    reciprocal::Matrix{Float64},
+    volume::Float64,
+    ionic_coefficients::Array{ComplexF64,3},
+    atomic_ionic_coefficients::Vector{Array{ComplexF64,3}},
+    core_density::Array{Float64,3},
+    atomic_core_coefficients::Vector{Array{ComplexF64,3}},
+    initial_density::Array{Float64,3},
+    nonlocal_projectors::Vector{NonlocalProjectors},
+    ion_ion_energy::Float64,
+)
+    cache = _basis_geometry_cache(basis, reciprocal, nonlocal_projectors)
+    PWKernel(
+        basis, reciprocal, volume, ionic_coefficients,
+        atomic_ionic_coefficients, core_density, atomic_core_coefficients,
+        initial_density, nonlocal_projectors, ion_ion_energy,
+        cache.fft_indices, cache.kinetic_energies, cache.grid_q2,
+        cache.hamiltonian_workspaces, cache.density_workspace)
 end
 
 function _fft_index(g::NTuple{3,Int}, dims::NTuple{3,Int})
@@ -125,6 +238,10 @@ function _nonlocal_projectors(basis::PlaneWaveBasis, kindex::Int,
     positions = getfield(crystal, :_positions)
     species = getfield(crystal, :_species)
     pseudos = getfield(model, :_pseudopotentials)
+    pseudo_signatures = Dict(
+        element => hash(upf.raw, hash(upf.path))
+        for (element, upf) in pseudos
+    )
     kpoint = getfield(basis, :_kpoints)[kindex]
     gvectors = getfield(basis, :_G_vectors)[kindex]
     momenta = [reciprocal * (collect(kpoint) .+ collect(g)) for g in gvectors]
@@ -148,7 +265,9 @@ function _nonlocal_projectors(basis::PlaneWaveBasis, kindex::Int,
     for (column, (atom, l, harmonic, projector)) in pairs(descriptors)
         upf = pseudos[species[atom]]
         radial = get!(radial_cache, (species[atom], projector)) do
-            [_projector_transform(upf, projector, q) for q in magnitudes]
+            [_cached_projector_transform(
+                 upf, pseudo_signatures[species[atom]], projector, q)
+             for q in magnitudes]
         end
         for row in eachindex(gvectors)
             direction = iszero(magnitudes[row]) ? [0.0, 0.0, 1.0] :
@@ -253,9 +372,8 @@ function _hartree(density::Array{Float64,3}, kernel::PWKernel)
     energy_value = 0.0
     dims = size(density)
     for i in axes(density, 1), j in axes(density, 2), k in axes(density, 3)
-        g = _grid_g((i, j, k), dims)
-        all(iszero, g) && continue
-        q2 = sum(abs2, kernel.reciprocal * collect(g))
+        q2 = kernel.grid_q2[i, j, k]
+        iszero(q2) && continue
         q2 / 2 <= 4getfield(kernel.basis, :_Ecut) || continue
         potential_coefficients[i, j, k] = 4pi * coefficients[i, j, k] / q2
         energy_value += 2pi * kernel.volume * abs2(coefficients[i, j, k]) / q2
@@ -286,10 +404,34 @@ struct KSHamiltonian <: AbstractMatrix{ComplexF64}
     kindex::Int
     local_potential::Array{Float64,3}
     kinetic::Vector{Float64}
+    workspace::HamiltonianWorkspace
 end
+
+KSHamiltonian(kernel::PWKernel, kindex::Int,
+              local_potential::Array{Float64,3},
+              kinetic::Vector{Float64}) =
+    KSHamiltonian(kernel, kindex, local_potential, kinetic,
+                  kernel.hamiltonian_workspaces[kindex])
 
 Base.size(operator::KSHamiltonian) =
     (length(operator.kinetic), length(operator.kinetic))
+
+function _batch_buffer!(workspace::HamiltonianWorkspace, number_vectors::Int)
+    get!(workspace.batches, number_vectors) do
+        grid = zeros(ComplexF64, workspace.dims..., number_vectors)
+        inverse_plan = plan_ifft!(
+            grid, (1, 2, 3); flags=FFTW.ESTIMATE)
+        forward_plan = plan_fft!(
+            grid, (1, 2, 3); flags=FFTW.ESTIMATE)
+        HamiltonianBatchBuffer(
+            grid,
+            forward_plan,
+            inverse_plan,
+            zeros(ComplexF64, workspace.number_projectors, number_vectors),
+            zeros(ComplexF64, workspace.number_projectors, number_vectors),
+        )
+    end
+end
 
 function LinearAlgebra.mul!(output::AbstractVecOrMat, operator::KSHamiltonian,
                             input::AbstractVecOrMat)
@@ -299,20 +441,28 @@ function LinearAlgebra.mul!(output::AbstractVecOrMat, operator::KSHamiltonian,
     size(output_matrix) == size(input_matrix) || throw(DimensionMismatch())
     dims = size(operator.local_potential)
     number_vectors = size(input_matrix, 2)
-    grids = zeros(ComplexF64, dims..., number_vectors)
-    gvectors = getfield(operator.kernel.basis, :_G_vectors)[operator.kindex]
-    for vector in 1:number_vectors, (row, g) in pairs(gvectors)
-        grids[_fft_index(g, dims)..., vector] = input_matrix[row, vector]
+    batch = _batch_buffer!(operator.workspace, number_vectors)
+    grid = batch.grid
+    fill!(grid, 0)
+    indices = operator.kernel.fft_indices[operator.kindex]
+    grid_matrix = reshape(grid, :, number_vectors)
+    for vector in 1:number_vectors, row in eachindex(indices)
+        grid_matrix[indices[row], vector] = input_matrix[row, vector]
     end
-    real_space = ifft(grids, (1, 2, 3))
-    real_space .*= reshape(operator.local_potential, dims..., 1)
-    local_grids = fft(real_space, (1, 2, 3))
-    for vector in 1:number_vectors, (row, g) in pairs(gvectors)
+    batch.inverse_plan * grid
+    grid .*= reshape(operator.local_potential, dims..., 1)
+    batch.forward_plan * grid
+    for vector in 1:number_vectors, row in eachindex(indices)
         output_matrix[row, vector] = operator.kinetic[row] * input_matrix[row, vector] +
-                                     local_grids[_fft_index(g, dims)..., vector]
+                                     grid_matrix[indices[row], vector]
     end
-    output_matrix .+= _apply_nonlocal(
-        operator.kernel.nonlocal_projectors[operator.kindex], input_matrix)
+    projectors = operator.kernel.nonlocal_projectors[operator.kindex]
+    if !isempty(batch.overlaps)
+        mul!(batch.overlaps, projectors.factors', input_matrix)
+        mul!(batch.coupled_overlaps, projectors.coupling, batch.overlaps)
+        mul!(output_matrix, projectors.factors, batch.coupled_overlaps,
+             true, true)
+    end
     output
 end
 
@@ -348,19 +498,39 @@ function _iterative_eigensolve(kernel::PWKernel, kindex::Int,
                                local_coefficients::Array{ComplexF64,3},
                                number_bands::Int,
                                previous::Union{Nothing,Matrix{ComplexF64}};
-                               target_residual::Float64=5e-8)
-    basis = kernel.basis
-    kpoint = getfield(basis, :_kpoints)[kindex]
-    gvectors = getfield(basis, :_G_vectors)[kindex]
-    kinetic = [sum(abs2, kernel.reciprocal *
-                   (collect(kpoint) .+ collect(g))) / 2 for g in gvectors]
-    operator = KSHamiltonian(kernel, kindex,
-                             _real_from_coefficients(local_coefficients), kinetic)
+                               target_residual::Float64=1e-10)
+    _iterative_eigensolve_real(
+        kernel, kindex, _real_from_coefficients(local_coefficients),
+        number_bands, previous; target_residual)
+end
+
+function _iterative_eigensolve_real(
+    kernel::PWKernel,
+    kindex::Int,
+    local_potential::Array{Float64,3},
+    number_bands::Int,
+    previous::Union{Nothing,Matrix{ComplexF64}};
+    target_residual::Float64=1e-10,
+)
+    kinetic = kernel.kinetic_energies[kindex]
+    operator = KSHamiltonian(
+        kernel, kindex, local_potential, kinetic)
+    _block_eigensolve(
+        operator, kinetic, number_bands, previous; target_residual)
+end
+
+function _block_eigensolve(
+    operator::AbstractMatrix{ComplexF64},
+    kinetic::Vector{Float64},
+    number_bands::Int,
+    previous::Union{Nothing,Matrix{ComplexF64}};
+    target_residual::Float64=1e-10,
+)
     subspace = _initial_subspace(kinetic, number_bands, previous)
     applied = similar(subspace)
     mul!(applied, operator, subspace)
-    # The default wavefunction residual sits below the 1e-8 density-response
-    # gate.  Response source construction requests a tighter value explicitly
+    # The default wavefunction residual sits comfortably below the 1e-8
+    # density-response gate. Response source construction may override it
     # because its covariant finite difference divides orbital errors by dk.
     # Medium supercells combine many folded, nearly degenerate occupied
     # states.  Four blocks are not enough to separate that cluster reliably:
@@ -422,34 +592,69 @@ function _iterative_eigensolve(kernel::PWKernel, kindex::Int,
     error("iterative eigensolver did not converge; maximum residual=$last_residual")
 end
 
-function _solve_electrons(kernel::PWKernel, local_coefficients::Array{ComplexF64,3},
-                          number_bands::Int;
-                          previous::Union{Nothing,Vector{Matrix{ComplexF64}}}=nothing,
-                          target_residual::Float64=5e-8)
+function _solve_electron_kpoint(
+    kernel::PWKernel,
+    local_coefficients::Array{ComplexF64,3},
+    local_potential::Union{Nothing,Array{Float64,3}},
+    number_bands::Int,
+    previous::Union{Nothing,Vector{Matrix{ComplexF64}}},
+    target_residual::Float64,
+    kindex::Int,
+)
+    basis = kernel.basis
+    dimension = length(getfield(basis, :_G_vectors)[kindex])
+    number_bands <= dimension || error(
+        "plane-wave basis is smaller than requested band count")
+    if _use_dense_eigensolver(dimension, number_bands)
+        matrix = _hamiltonian(kernel, kindex, local_coefficients)
+        decomposition = eigen(Hermitian(matrix), 1:number_bands)
+        return Vector{Float64}(decomposition.values),
+               Matrix{ComplexF64}(decomposition.vectors)
+    end
+    prior = previous === nothing ? nothing : previous[kindex]
+    _iterative_eigensolve_real(
+        kernel, kindex, something(local_potential), number_bands, prior;
+        target_residual)
+end
+
+function _solve_electrons_backend(
+    ::ThreadedCPUBackend,
+    kernel::PWKernel,
+    local_coefficients::Array{ComplexF64,3},
+    number_bands::Int,
+    previous::Union{Nothing,Vector{Matrix{ComplexF64}}},
+    target_residual::Float64,
+)
     basis = kernel.basis
     nk = length(getfield(basis, :_kpoints))
     values = Vector{Vector{Float64}}(undef, nk)
     vectors = Vector{Matrix{ComplexF64}}(undef, nk)
+    dimensions = length.(getfield(basis, :_G_vectors))
+    local_potential = any(dimension ->
+        !_use_dense_eigensolver(dimension, number_bands), dimensions) ?
+        _real_from_coefficients(local_coefficients) : nothing
     Threads.@threads for kindex in 1:nk
-        dimension = length(getfield(basis, :_G_vectors)[kindex])
-        number_bands <= dimension || error(
-            "plane-wave basis is smaller than requested band count")
-        # LAPACK's selected-spectrum path is both faster and more robust for
-        # medium cells.  Above this boundary the dense matrix footprint grows
-        # rapidly, so the independent matrix-free block solver takes over.
-        if dimension <= 1800
-            matrix = _hamiltonian(kernel, kindex, local_coefficients)
-            decomposition = eigen(Hermitian(matrix), 1:number_bands)
-            values[kindex] = decomposition.values
-            vectors[kindex] = decomposition.vectors
-        else
-            prior = previous === nothing ? nothing : previous[kindex]
-            values[kindex], vectors[kindex] = _iterative_eigensolve(
-                kernel, kindex, local_coefficients, number_bands, prior;
-                target_residual)
-        end
+        values[kindex], vectors[kindex] = _solve_electron_kpoint(
+            kernel, local_coefficients, local_potential, number_bands,
+            previous, target_residual, kindex)
     end
     values, vectors
+end
+
+_use_dense_eigensolver(dimension::Int, number_bands::Int) =
+    dimension <= max(64, 4number_bands)
+
+function _solve_electrons(
+    kernel::PWKernel,
+    local_coefficients::Array{ComplexF64,3},
+    number_bands::Int;
+    previous::Union{Nothing,Vector{Matrix{ComplexF64}}}=nothing,
+    target_residual::Float64=1e-10,
+    backend::AbstractSCFBackend=ThreadedCPUBackend(),
+)
+    _solve_electrons_backend(
+        backend, kernel, local_coefficients, number_bands, previous,
+        target_residual)
 end
 
 function _density_from_orbitals(kernel::PWKernel,
@@ -457,18 +662,30 @@ function _density_from_orbitals(kernel::PWKernel,
                                 noccupied::Int)
     basis = kernel.basis
     dims = getfield(basis, :_fft_size)
-    density = zeros(Float64, dims)
     weights = getfield(basis, :_kweights)
-    for kindex in eachindex(orbitals)
-        gvectors = getfield(basis, :_G_vectors)[kindex]
+    workspace = kernel.density_workspace
+    scale = prod(dims) / sqrt(kernel.volume)
+    Threads.@threads for kindex in eachindex(orbitals)
+        coefficients = workspace.buffers[kindex]
+        plan = workspace.inverse_plans[kindex]
+        partial_density = workspace.partial_densities[kindex]
+        fill!(partial_density, 0)
+        indices = kernel.fft_indices[kindex]
         for band in 1:noccupied
-            coefficients = zeros(ComplexF64, dims)
-            for (row, g) in pairs(gvectors)
-                coefficients[_fft_index(g, dims)...] = orbitals[kindex][row, band]
+            fill!(coefficients, 0)
+            for row in eachindex(indices)
+                coefficients[indices[row]] = orbitals[kindex][row, band]
             end
-            periodic_orbital = ifft(coefficients) .* (prod(dims) / sqrt(kernel.volume))
-            density .+= 2weights[kindex] .* abs2.(periodic_orbital)
+            plan * coefficients
+            factor = 2weights[kindex] * scale^2
+            @inbounds @simd for index in eachindex(partial_density)
+                partial_density[index] += factor * abs2(coefficients[index])
+            end
         end
+    end
+    density = zeros(Float64, dims)
+    for partial_density in workspace.partial_densities
+        density .+= partial_density
     end
     density
 end
@@ -476,6 +693,16 @@ end
 function _mix_density(density::Array{Float64,3}, output::Array{Float64,3},
                       kernel::PWKernel; mixing::Float64=0.7,
                       screening::Float64=1.0)
+    preconditioned = _precondition_density_residual(
+        density, output, kernel; screening)
+    mixed = density .+ mixing .* preconditioned
+    _normalize_density!(mixed, kernel)
+end
+
+function _precondition_density_residual(
+    density::Array{Float64,3}, output::Array{Float64,3}, kernel::PWKernel;
+    screening::Float64=1.0,
+)
     residual_coefficients = fft(output .- density) / length(density)
     dims = size(density)
     for i in axes(density, 1), j in axes(density, 2), k in axes(density, 3)
@@ -483,21 +710,157 @@ function _mix_density(density::Array{Float64,3}, output::Array{Float64,3},
         if all(iszero, g)
             residual_coefficients[i, j, k] = 0
         else
-            q2 = sum(abs2, kernel.reciprocal * collect(g))
-            residual_coefficients[i, j, k] *= mixing * q2 / (q2 + screening)
+            q2 = kernel.grid_q2[i, j, k]
+            residual_coefficients[i, j, k] *= q2 / (q2 + screening)
         end
     end
-    mixed = density .+ real.(ifft(residual_coefficients) .* length(density))
+    real.(ifft(residual_coefficients) .* length(density))
+end
+
+function _normalize_density!(mixed::Array{Float64,3}, kernel::PWKernel)
     target_average = getfield(getfield(kernel.basis, :_model), :_electron_count) /
                      kernel.volume
     mixed .+= target_average - sum(mixed) / length(mixed)
     mixed
 end
 
+mutable struct DensityMixer
+    damping::Float64
+    screening::Float64
+    max_history::Int
+    densities::Vector{Array{Float64,3}}
+    residuals::Vector{Array{Float64,3}}
+end
+
+function DensityMixer(; damping::Real=0.7, screening::Real=1.0,
+                      max_history::Integer=8)
+    _require(isfinite(damping) && 0 < damping <= 1,
+             "density-mixer damping must lie in (0,1]")
+    _require(isfinite(screening) && screening >= 0,
+             "density-mixer screening must be finite and nonnegative")
+    _require(max_history >= 1, "density-mixer history must be positive")
+    DensityMixer(
+        Float64(damping),
+        Float64(screening),
+        Int(max_history),
+        Array{Float64,3}[],
+        Array{Float64,3}[],
+    )
+end
+
+function _history_value(
+    history::Vector{Array{Float64,3}},
+    current::Array{Float64,3},
+    first_index::Int,
+    offset::Int,
+)
+    index = first_index + offset
+    index <= length(history) ? history[index] : current
+end
+
+function _difference_dot(
+    left_after::Array{Float64,3}, left_before::Array{Float64,3},
+    right_after::Array{Float64,3}, right_before::Array{Float64,3},
+)
+    value = 0.0
+    @inbounds @simd for index in eachindex(left_after)
+        value += (left_after[index] - left_before[index]) *
+                 (right_after[index] - right_before[index])
+    end
+    value
+end
+
+function _difference_current_dot(
+    after::Array{Float64,3}, before::Array{Float64,3},
+    current::Array{Float64,3},
+)
+    value = 0.0
+    @inbounds @simd for index in eachindex(after)
+        value += (after[index] - before[index]) * current[index]
+    end
+    value
+end
+
+function _anderson_mix!(
+    mixer::DensityMixer,
+    density::Array{Float64,3},
+    output::Array{Float64,3},
+    kernel::PWKernel,
+)
+    residual = _precondition_density_residual(
+        density, output, kernel; screening=mixer.screening)
+    nhistory = min(length(mixer.densities), mixer.max_history)
+    mixed = density .+ mixer.damping .* residual
+
+    if nhistory > 0
+        first_index = length(mixer.densities) - nhistory + 1
+        gram = zeros(Float64, nhistory, nhistory)
+        right_hand_side = zeros(Float64, nhistory)
+        for column in 1:nhistory
+            f_before = _history_value(
+                mixer.residuals, residual, first_index, column - 1)
+            f_after = _history_value(
+                mixer.residuals, residual, first_index, column)
+            right_hand_side[column] =
+                _difference_current_dot(f_after, f_before, residual)
+            for row in 1:column
+                g_before = _history_value(
+                    mixer.residuals, residual, first_index, row - 1)
+                g_after = _history_value(
+                    mixer.residuals, residual, first_index, row)
+                value = _difference_dot(
+                    f_after, f_before, g_after, g_before)
+                gram[row, column] = value
+                gram[column, row] = value
+            end
+        end
+        scale = maximum(abs, gram; init=0.0)
+        regularization = max(1e-14, 1e-10scale)
+        @inbounds for index in 1:nhistory
+            gram[index, index] += regularization
+        end
+        coefficients = try
+            Symmetric(gram) \ right_hand_side
+        catch
+            fill(NaN, nhistory)
+        end
+        if all(isfinite, coefficients)
+            @inbounds for column in 1:nhistory
+                x_before = _history_value(
+                    mixer.densities, density, first_index, column - 1)
+                x_after = _history_value(
+                    mixer.densities, density, first_index, column)
+                f_before = _history_value(
+                    mixer.residuals, residual, first_index, column - 1)
+                f_after = _history_value(
+                    mixer.residuals, residual, first_index, column)
+                coefficient = coefficients[column]
+                @simd for index in eachindex(mixed)
+                    mixed[index] -= coefficient * (
+                        x_after[index] - x_before[index] +
+                        mixer.damping * (f_after[index] - f_before[index]))
+                end
+            end
+        else
+            empty!(mixer.densities)
+            empty!(mixer.residuals)
+        end
+    end
+
+    push!(mixer.densities, copy(density))
+    push!(mixer.residuals, residual)
+    while length(mixer.densities) > mixer.max_history
+        popfirst!(mixer.densities)
+        popfirst!(mixer.residuals)
+    end
+    _normalize_density!(mixed, kernel)
+end
+
 function _electronic_step(kernel::PWKernel, density_value::Array{Float64,3},
                           number_bands::Int, noccupied::Int;
                           previous_orbitals::Union{Nothing,Vector{Matrix{ComplexF64}}}=nothing,
-                          external_coefficients::Union{Nothing,Array{ComplexF64,3}}=nothing)
+                          external_coefficients::Union{Nothing,Array{ComplexF64,3}}=nothing,
+                          backend::AbstractSCFBackend=ThreadedCPUBackend())
     hartree_coefficients, hartree_energy = _hartree(density_value, kernel)
     xc_energy, xc_potential = _xc_energy_potential(
         getfield(getfield(kernel.basis, :_model), :_xc), density_value,
@@ -507,7 +870,8 @@ function _electronic_step(kernel::PWKernel, density_value::Array{Float64,3},
     local_coefficients = kernel.ionic_coefficients .+ hartree_coefficients .+ xc_coefficients
     external_coefficients === nothing || (local_coefficients .+= external_coefficients)
     band_values, orbitals = _solve_electrons(
-        kernel, local_coefficients, number_bands; previous=previous_orbitals)
+        kernel, local_coefficients, number_bands;
+        previous=previous_orbitals, backend)
     output_density = _density_from_orbitals(kernel, orbitals, noccupied)
     weights = getfield(kernel.basis, :_kweights)
     band_energy = sum(weights[k] * 2sum(band_values[k][1:noccupied])

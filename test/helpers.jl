@@ -102,6 +102,9 @@ function synthetic_ground_state()
         [orbital],
         1e-12,
         1e-10,
+        1,
+        [-1.25],
+        [1e-10],
     )
 end
 

@@ -14,11 +14,33 @@ mutable struct GroundState
     orbitals::Vector{Matrix{ComplexF64}}
     residual_energy::Float64
     residual_density::Float64
+    iteration_count::Int
+    energy_history::Vector{Float64}
+    density_residual_history::Vector{Float64}
 end
+
+function Base.getproperty(gs::GroundState, name::Symbol)
+    name === :iterations && return getfield(gs, :iteration_count)
+    name === :energy_history && return copy(getfield(gs, :energy_history))
+    name === :density_residual_history &&
+        return copy(getfield(gs, :density_residual_history))
+    getfield(gs, name)
+end
+
+Base.propertynames(::GroundState, ::Bool=false) =
+    (fieldnames(GroundState)..., :iterations)
 
 const _KERNEL_CACHE = IdDict{PlaneWaveBasis,PWKernel}()
 
 function ground_state(basis::PlaneWaveBasis; options::SCFOptions=SCFOptions())
+    _ground_state_backend(basis, options, ThreadedCPUBackend())
+end
+
+function _ground_state_backend(
+    basis::PlaneWaveBasis,
+    options::SCFOptions,
+    backend::AbstractSCFBackend,
+)
     options.maxiter == 1 && error("SCF did not converge within maxiter=1")
     kernel = get!(_KERNEL_CACHE, basis) do
         _build_kernel(basis)
@@ -32,15 +54,20 @@ function ground_state(basis::PlaneWaveBasis; options::SCFOptions=SCFOptions())
     residual_energy = Inf
     residual_density = Inf
     previous_orbitals = nothing
+    energies = Float64[]
+    density_residuals = Float64[]
+    mixer = DensityMixer()
 
     for iteration in 1:options.maxiter
         step = _electronic_step(
             kernel, density_value, number_bands, noccupied;
-            previous_orbitals=previous_orbitals)
+            previous_orbitals=previous_orbitals, backend)
         residual_energy = abs(step.total - previous_energy)
         residual_density = sqrt(sum(abs2, step.output_density .- density_value) /
                                 length(density_value)) * kernel.volume /
                            max(electron_count, 1)
+        push!(energies, step.total)
+        push!(density_residuals, residual_density)
         last_step = step
         if iteration > 1 && residual_energy <= options.energy_tolerance &&
            residual_density <= options.density_tolerance
@@ -54,10 +81,11 @@ function ground_state(basis::PlaneWaveBasis; options::SCFOptions=SCFOptions())
                 basis, options, kernel, true, step.total, zeros(3, nat), false,
                 zeros(3, 3), false,
                 density_value, step.band_values, occupations_value, step.orbitals,
-                residual_energy, residual_density,
+                residual_energy, residual_density, iteration,
+                copy(energies), copy(density_residuals),
             )
         end
-        density_value = _mix_density(density_value, step.output_density, kernel)
+        density_value = _anderson_mix!(mixer, density_value, step.output_density, kernel)
         previous_energy = step.total
         previous_orbitals = step.orbitals
     end
@@ -89,7 +117,9 @@ function _ground_state_external(basis::PlaneWaveBasis,
     residual_energy = Inf
     residual_density = Inf
     previous_fixed_point_residual = Inf
-    mixing = 0.5
+    energies = Float64[]
+    density_residuals = Float64[]
+    mixer = DensityMixer(; damping=0.5, screening=0.5)
     for iteration in 1:options.maxiter
         step = _electronic_step(
             kernel, density_value, number_bands, noccupied;
@@ -98,6 +128,8 @@ function _ground_state_external(basis::PlaneWaveBasis,
         residual_density = sqrt(sum(abs2, step.output_density .- density_value) /
                                 length(density_value)) * kernel.volume /
                            max(electron_count, 1)
+        push!(energies, step.total)
+        push!(density_residuals, residual_density)
         if iteration > 1 && residual_energy <= options.energy_tolerance &&
            residual_density <= options.density_tolerance
             occupations_value = [vcat(fill(2.0, noccupied),
@@ -108,7 +140,8 @@ function _ground_state_external(basis::PlaneWaveBasis,
             return GroundState(
                 basis, options, kernel, true, step.total, zeros(3, nat), false,
                 zeros(3, 3), false, step.output_density, step.band_values,
-                occupations_value, step.orbitals, residual_energy, residual_density)
+                occupations_value, step.orbitals, residual_energy, residual_density,
+                iteration, copy(energies), copy(density_residuals))
         end
         # Displaced supercells contain folded near-degenerate bands, so their
         # exact occupied projector can expose charge sloshing hidden by an
@@ -118,14 +151,15 @@ function _ground_state_external(basis::PlaneWaveBasis,
         # without destabilising the high-G components.
         if isfinite(previous_fixed_point_residual)
             if residual_density > 1.05previous_fixed_point_residual
-                mixing = max(0.05, 0.5mixing)
+                mixer.damping = max(0.05, 0.5mixer.damping)
+                empty!(mixer.densities)
+                empty!(mixer.residuals)
             elseif residual_density < 0.7previous_fixed_point_residual
-                mixing = min(0.6, 1.1mixing)
+                mixer.damping = min(0.6, 1.1mixer.damping)
             end
         end
-        density_value = _mix_density(
-            density_value, step.output_density, kernel;
-            mixing, screening=0.5)
+        density_value = _anderson_mix!(
+            mixer, density_value, step.output_density, kernel)
         previous_fixed_point_residual = residual_density
         previous_energy = step.total
         previous_orbitals = step.orbitals
