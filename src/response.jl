@@ -630,7 +630,7 @@ function _response_force_state(gs::GroundState,
         [gs.band_values[k][1:noccupied]
          for k in eachindex(gs.band_values)],
         [fill(2.0, noccupied) for _ in eachindex(gs.band_values)],
-        orbitals, 0.0, 0.0)
+        orbitals, 0.0, 0.0, 0, Float64[], Float64[])
 end
 
 function _electric_ground_data(gs::GroundState)

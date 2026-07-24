@@ -7,7 +7,7 @@ or call DFTK or Quantum ESPRESSO. The runtime dependency graph contains only
 generic Julia numerical infrastructure: linear algebra, FFTs, special
 functions, ChainRules, and Libxc binaries.
 
-Quantum ESPRESSO 7.5 is confined to the private verification repository. It is
+Quantum ESPRESSO 7.5 is confined to the separate verification repository. It is
 an external numerical oracle there and is neither a build dependency nor a
 runtime fallback of this package.
 
@@ -24,9 +24,14 @@ The code follows the physical dependency order:
 4. `xc.jl` evaluates one internally consistent LDA or PBE energy and potential;
    spectral derivatives and Hartree terms use that same density sphere.
 5. `hamiltonian.jl` builds local coefficients, Ewald and nonlocal terms, and
-   applies dense or matrix-free Kohn-Sham Hamiltonians. Large bases use the
-   package's own restarted, preconditioned block-Davidson solver.
-6. `ground_state.jl` solves the density fixed point and evaluates stationary
+   applies dense or matrix-free Kohn-Sham Hamiltonians. Only toy-sized bases
+   materialize the matrix; routine bases use the package's own restarted,
+   preconditioned block-Davidson solver. Kinetic energies, G-to-FFT mappings,
+   FFT plans, nonlocal radial transforms, and Hamiltonian/density workspaces
+   persist across SCF iterations.
+6. `ground_state.jl` solves the density fixed point with a Kerker-preconditioned
+   Anderson/Pulay history mixer. It records energy and density-residual
+   histories for convergence diagnosis and evaluates stationary
    energy, analytic forces projected onto the periodic zero-net-force
    subspace, and frozen-topology stress.
 7. `response.jl` evaluates atomic and commensurate-supercell phonon response.
@@ -39,6 +44,31 @@ The code follows the physical dependency order:
 
 There is one canonical numerical model behind both native Julia construction
 and QE-compatible input parsing.
+
+## Parallel execution
+
+The default CPU backend parallelizes independent k points with Julia threads
+and keeps one FFT/Hamiltonian workspace per k point. Set `JULIA_NUM_THREADS`
+before starting Julia; BLAS threads should normally remain at one when k-point
+parallelism is available.
+
+MPI and CUDA are weak dependencies implemented as package extensions, so the
+default CPU installation remains unchanged:
+
+```julia
+using EspressoDFT, MPI
+gs = EspressoDFT.mpi_ground_state(basis; options, communicator=MPI.COMM_WORLD)
+
+using EspressoDFT, CUDA
+gs = EspressoDFT.gpu_ground_state(basis; options, device=0)
+```
+
+The MPI baseline distributes k-point eigensolves across ranks and broadcasts
+their results so every rank advances the identical SCF fixed point. The CUDA
+baseline runs matrix-free Hamiltonian FFT, kinetic, and nonlocal operations on
+one selected GPU while keeping the small projected eigensystem and SCF control
+flow on the CPU. Neither extension changes the frozen export list or the
+stationary differentiation rule.
 
 ## Differentiability is a model property
 
@@ -65,8 +95,8 @@ phases or rotations.
 
 ## Verification boundary
 
-Public tests check the exported API, validation invariants, and local numerical
-identities such as PBE energy–potential consistency. The private verifier owns
-the licensed test fixtures, QE 7.5 observations, held-out structures, mutation
-sentinels, differentiability tests, and complete workflow tests. Passing only
-the public tests is not evidence of phase completion.
+Package tests check the exported API, validation invariants, and local numerical
+identities such as PBE energy–potential consistency. The separate public
+verifier owns the independently pinned fixtures, QE 7.5 observations, held-out
+structures, mutation sentinels, differentiability tests, and complete workflow
+tests. Passing only the package tests is not evidence of phase completion.

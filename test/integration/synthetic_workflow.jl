@@ -8,6 +8,14 @@ const SYNTHETIC_OPTIONS = SCFOptions(
 @testset "synthetic public ground-state workflow preserves invariants" begin
     gs = ground_state(SYNTHETIC_BASIS; options=SYNTHETIC_OPTIONS)
     @test isfinite(energy(gs))
+    @test hasproperty(gs, :iterations)
+    @test gs.iterations == length(gs.energy_history)
+    @test gs.iterations == length(gs.density_residual_history)
+    @test last(gs.density_residual_history) <=
+          SYNTHETIC_OPTIONS.density_tolerance
+    copied_history = gs.energy_history
+    copied_history[1] = Inf
+    @test isfinite(first(gs.energy_history))
     @test size(forces(gs)) == (3, 1)
     @test vec(sum(forces(gs); dims=2)) ≈ zeros(3) atol=1e-12
     @test stress(gs) ≈ stress(gs)' atol=1e-12
